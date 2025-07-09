@@ -4,11 +4,11 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
@@ -73,7 +73,7 @@ class ConvND(base.Module):
     if not 1 <= num_spatial_dims <= 3:
       raise ValueError(
           "We only support convoltion operations for num_spatial_dims=1, 2 or "
-          "3, received num_spatial_dims={}.".format(num_spatial_dims))
+          f"3, received num_spatial_dims={num_spatial_dims}.")
     self._num_spatial_dims = num_spatial_dims
     self.output_channels = output_channels
     self.kernel_shape = kernel_shape
@@ -129,9 +129,23 @@ class ConvND(base.Module):
   def _initialize(self, inputs: tf.Tensor):
     """Constructs parameters used by this module."""
     utils.assert_rank(inputs, self._num_spatial_dims + 2)
-    self.input_channels = inputs.shape[self._channel_index]
+
+    # To build the weight matrix, we need the static value of the input
+    # channel dimension. Directly accessing `inputs.shape` can fail inside a
+    # `tf.function` if the dimension is symbolic (e.g., `None`).
+    # `tf.compat.v1.dimension_value` provides a safe way to get the static
+    # value, returning `None` if it's not available, which allows us to
+    # provide a clear error message.
+    self.input_channels = tf.compat.v1.dimension_value(
+        inputs.shape[self._channel_index])
+
     if self.input_channels is None:
-      raise ValueError("The number of input channels must be known.")
+      raise ValueError(
+          "The channel dimension of the inputs to `snt.ConvND` must be "
+          "statically known when building the module for the first time. "
+          "Please ensure the input tensor has a defined shape at "
+          f"axis {self._channel_index}. Received input shape: {inputs.shape}")
+
     self._dtype = inputs.dtype
 
     self.w = self._make_w()
@@ -238,7 +252,7 @@ class Conv2D(ConvND):
         dimensions.
       stride: Sequence of strides (of length 2), or an integer. ``stride`` will
         be expanded to define stride in all dimensions.
-      rate: Sequence of dilation rates (of length 2), or integer that is used to
+      rate: Sequence of dilation rates of length 2, or integer that is used to
         define dilation rate in all dimensions. 1 corresponds to standard
         convolution, ``rate > 1`` corresponds to dilated convolution.
       padding: Padding to apply to the input. This can either ``SAME``,
