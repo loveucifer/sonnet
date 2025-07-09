@@ -4,365 +4,336 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for sonnet.v2.src.conv."""
+"""Convolutional modules."""
 
-from absl.testing import parameterized
+from typing import Optional, Sequence, Union
+
 import numpy as np
-from sonnet.src import conv
+from sonnet.src import base
 from sonnet.src import initializers
-from sonnet.src import test_utils
+from sonnet.src import once
+from sonnet.src import pad
+from sonnet.src import utils
 import tensorflow as tf
 
 
-def create_constant_initializers(w, b, with_bias):
-  if with_bias:
-    return {
-        "w_init": initializers.Constant(w),
-        "b_init": initializers.Constant(b)
-    }
-  else:
-    return {"w_init": initializers.Constant(w)}
+class ConvND(base.Module):
+  """A general N-dimensional convolutional module."""
+
+  def __init__(self,
+               num_spatial_dims: int,
+               output_channels: int,
+               kernel_shape: Union[int, Sequence[int]],
+               stride: Union[int, Sequence[int]] = 1,
+               rate: Union[int, Sequence[int]] = 1,
+               padding: Union[str, pad.Paddings] = "SAME",
+               with_bias: bool = True,
+               w_init: Optional[initializers.Initializer] = None,
+               b_init: Optional[initializers.Initializer] = None,
+               data_format: Optional[str] = None,
+               name: Optional[str] = None):
+    """Constructs a `ConvND` module.
+
+    Args:
+      num_spatial_dims: The number of spatial dimensions of the input.
+      output_channels: The number of output channels.
+      kernel_shape: Sequence of kernel sizes (of length num_spatial_dims), or an
+        integer. `kernel_shape` will be expanded to define a kernel size in all
+        dimensions.
+      stride: Sequence of strides (of length num_spatial_dims), or an integer.
+        `stride` will be expanded to define stride in all dimensions.
+      rate: Sequence of dilation rates (of length num_spatial_dims), or integer
+        that is used to define dilation rate in all dimensions. 1 corresponds to
+        standard ND convolution, `rate > 1` corresponds to dilated convolution.
+      padding: Padding to apply to the input. This can either "SAME", "VALID" or
+        a callable or sequence of callables up to size N. Any callables must
+        take a single integer argument equal to the effective kernel size and
+        return a list of two integers representing the padding before and after.
+        See snt.pad.* for more details and example functions.
+      with_bias: Whether to include bias parameters. Default `True`.
+      w_init: Optional initializer for the weights. By default the weights are
+        initialized truncated random normal values with a standard deviation of
+        `1 / sqrt(input_feature_size)`, which is commonly used when the inputs
+        are zero centered (see https://arxiv.org/abs/1502.03167v3).
+      b_init: Optional initializer for the bias. By default the bias is
+        initialized to zero.
+      data_format: The data format of the input.
+      name: Name of the module.
+    """
+    super().__init__(name=name)
+
+    if not 1 <= num_spatial_dims <= 3:
+      raise ValueError(
+          "We only support convoltion operations for num_spatial_dims=1, 2 or "
+          f"3, received num_spatial_dims={num_spatial_dims}.")
+    self._num_spatial_dims = num_spatial_dims
+    self.output_channels = output_channels
+    self.kernel_shape = kernel_shape
+    self.stride = stride
+    self.rate = rate
+
+    if isinstance(padding, str):
+      self.conv_padding = padding.upper()
+      self.padding_func = None
+    else:
+      self.conv_padding = "VALID"
+      self.padding_func = padding
+
+    self.data_format = data_format
+    self._channel_index = utils.get_channel_index(data_format)
+    self.with_bias = with_bias
+
+    self.w_init = w_init
+    if with_bias:
+      self.b_init = b_init if b_init is not None else initializers.Zeros()
+    elif b_init is not None:
+      raise ValueError("When not using a bias the b_init must be None.")
+
+  def __call__(self, inputs: tf.Tensor) -> tf.Tensor:
+    """Applies the defined convolution to the inputs.
+
+    Args:
+      inputs: An ``N + 2`` rank :tf:`Tensor` of dtype :tf:`float16`,
+        :tf:`bfloat16` or `tf.float32` to which the convolution is applied.
+
+    Returns:
+      An ``N + 2`` dimensional :tf:`Tensor` of shape
+        ``[batch_size, output_dim_1, output_dim_2, ..., output_channels]``.
+    """
+    self._initialize(inputs)
+
+    if self.padding_func:
+      inputs = tf.pad(inputs, self._padding)
+
+    outputs = tf.nn.convolution(
+        inputs,
+        self.w,
+        strides=self.stride,
+        padding=self.conv_padding,
+        dilations=self.rate,
+        data_format=self.data_format)
+    if self.with_bias:
+      outputs = tf.nn.bias_add(outputs, self.b, data_format=self.data_format)
+
+    return outputs
+
+  @once.once
+  def _initialize(self, inputs: tf.Tensor):
+    """Constructs parameters used by this module."""
+    utils.assert_rank(inputs, self._num_spatial_dims + 2)
+
+    # To build the weight matrix, we need the static value of the input
+    # channel dimension. Directly accessing `inputs.shape` can fail inside a
+    # `tf.function` if the dimension is symbolic (e.g., `None`).
+    # `tf.compat.v1.dimension_value` provides a safe way to get the static
+    # value, returning `None` if it's not available, which allows us to
+    # provide a clear error message.
+    self.input_channels = tf.compat.v1.dimension_value(
+        inputs.shape[self._channel_index])
+
+    if self.input_channels is None:
+      raise ValueError(
+          "The channel dimension of the inputs to `snt.ConvND` must be "
+          "statically known when building the module for the first time. "
+          "Please ensure the input tensor has a defined shape at "
+          f"axis {self._channel_index}. Received input shape: {inputs.shape}")
+
+    self._dtype = inputs.dtype
+
+    self.w = self._make_w()
+    if self.with_bias:
+      self.b = tf.Variable(
+          self.b_init((self.output_channels,), self._dtype), name="b")
+
+    if self.padding_func:
+      self._padding = pad.create(
+          padding=self.padding_func,
+          kernel=self.kernel_shape,
+          rate=self.rate,
+          n=self._num_spatial_dims,
+          channel_index=self._channel_index)
+
+  def _make_w(self):
+    weight_shape = utils.replicate(self.kernel_shape, self._num_spatial_dims,
+                                   "kernel_shape")
+    weight_shape = weight_shape + (self.input_channels, self.output_channels)
+
+    if self.w_init is None:
+      # See https://arxiv.org/abs/1502.03167v3.
+      fan_in_shape = weight_shape[:-1]
+      stddev = 1 / np.sqrt(np.prod(fan_in_shape))
+      self.w_init = initializers.TruncatedNormal(stddev=stddev)
+
+    return tf.Variable(self.w_init(weight_shape, self._dtype), name="w")
 
 
-class ConvTest(test_utils.TestCase, parameterized.TestCase):
+class Conv1D(ConvND):
+  """``Conv1D`` module."""
 
-  def testPaddingFunctionReached(self):
-    self.reached = False
+  def __init__(self,
+               output_channels: int,
+               kernel_shape: Union[int, Sequence[int]],
+               stride: Union[int, Sequence[int]] = 1,
+               rate: Union[int, Sequence[int]] = 1,
+               padding: Union[str, pad.Paddings] = "SAME",
+               with_bias: bool = True,
+               w_init: Optional[initializers.Initializer] = None,
+               b_init: Optional[initializers.Initializer] = None,
+               data_format: str = "NWC",
+               name: Optional[str] = None):
+    """Constructs a ``Conv1D`` module.
 
-    def padding_func(*unused_args):
-      padding_func.called = True
-      return [0, 0]
-
-    conv1 = conv.ConvND(
-        num_spatial_dims=2,
-        output_channels=1,
-        kernel_shape=3,
-        stride=1,
-        padding=padding_func,
-        data_format="NHWC",
-        **create_constant_initializers(1.0, 1.0, True))
-
-    conv1(tf.ones([1, 5, 5, 1], dtype=tf.float32))
-
-    self.assertEqual(conv1.conv_padding, "VALID")
-    self.assertEqual(conv1.padding_func, padding_func)
-    self.assertTrue(getattr(padding_func, "called", False))
-
-  @parameterized.parameters(0, 4)
-  def testIncorrectN(self, n):
-    with self.assertRaisesRegex(
-        ValueError,
-        "We only support convoltion operations for num_spatial_dims=1, 2 or 3"):
-      conv.ConvND(
-          num_spatial_dims=n,
-          output_channels=1,
-          kernel_shape=3,
-          data_format="NHWC")
-
-  def testInitializerKeysInvalidWithoutBias(self):
-    with self.assertRaisesRegex(ValueError, "b_init must be None"):
-      conv.ConvND(
-          num_spatial_dims=2,
-          output_channels=1,
-          kernel_shape=3,
-          data_format="NHWC",
-          with_bias=False,
-          b_init=tf.zeros_initializer())
-
-  def testIncorrectRankInput(self):
-    c = conv.ConvND(
-        num_spatial_dims=2,
-        output_channels=1,
-        kernel_shape=3,
-        data_format="NHWC")
-    with self.assertRaisesRegex(ValueError, "Shape .* must have rank 4"):
-      c(tf.ones([2, 4, 4]))
-
-  @parameterized.parameters(tf.float32, tf.float64)
-  def testDefaultInitializers(self, dtype):
-    if "TPU" in self.device_types and dtype == tf.float64:
-      self.skipTest("Double precision not supported on TPU.")
-
-    conv1 = conv.ConvND(
-        num_spatial_dims=2,
-        output_channels=1,
-        kernel_shape=16,
-        stride=1,
-        padding="VALID",
-        data_format="NHWC")
-
-    out = conv1(tf.random.normal([8, 64, 64, 1], dtype=dtype))
-
-    self.assertAllEqual(out.shape, [8, 49, 49, 1])
-    self.assertEqual(out.dtype, dtype)
-
-    # Note that for unit variance inputs the output is below unit variance
-    # because of the use of the truncated normal initalizer
-    err = 0.2 if self.primary_device == "TPU" else 0.1
-    self.assertNear(out.numpy().std(), 0.87, err=err)
-
-  @parameterized.named_parameters(
-      ("SamePaddingUseBias", True, "SAME"),
-      ("SamePaddingNoBias", False, "SAME"),
-      ("samePaddingUseBias", True, "same"),
-      ("samePaddingNoBias", False, "same"),
-      ("ValidPaddingNoBias", False, "VALID"),
-      ("ValidPaddingUseBias", True, "VALID"),
-      ("validPaddingNoBias", False, "valid"),
-      ("validPaddingUseBias", True, "valid"),
-  )
-  def testFunction(self, with_bias, padding):
-    conv1 = conv.ConvND(
-        num_spatial_dims=2,
-        output_channels=1,
-        kernel_shape=3,
-        stride=1,
+    Args:
+      output_channels: The number of output channels.
+      kernel_shape: Sequence of length 1, or an integer. ``kernel_shape`` will
+        be expanded to define a kernel size in all dimensions.
+      stride: Sequence of strides of length 1, or an integer. ``stride`` will be
+        expanded to define stride in all dimensions.
+      rate: Sequence of dilation rates of length 1, or integer that is used to
+        define dilation rate in all dimensions. 1 corresponds to standard
+        convolution, ``rate > 1`` corresponds to dilated convolution.
+      padding: Padding to apply to the input. This can be either ``SAME``,
+        ``VALID`` or a callable or sequence of callables of size 1. Any
+        callables must take a single integer argument equal to the effective
+        kernel size and return a list of two integers representing the padding
+        before and after. See snt.pad.* for more details and example functions.
+      with_bias: Whether to include bias parameters. Default ``True``.
+      w_init: Optional initializer for the weights. By default the weights are
+        initialized truncated random normal values with a standard deviation of
+        ``1``/``sqrt(input_feature_size)``, which is commonly used when the
+        inputs are zero centered (see https://arxiv.org/abs/1502.03167v3).
+      b_init: Optional initializer for the bias. By default the bias is
+        initialized to zero.
+      data_format: The data format of the input.
+      name: Name of the module.
+    """
+    super().__init__(
+        num_spatial_dims=1,
+        output_channels=output_channels,
+        kernel_shape=kernel_shape,
+        stride=stride,
+        rate=rate,
         padding=padding,
         with_bias=with_bias,
-        data_format="NHWC",
-        **create_constant_initializers(1.0, 1.0, with_bias))
-    conv2 = conv.ConvND(
+        w_init=w_init,
+        b_init=b_init,
+        data_format=data_format,
+        name=name)
+
+
+class Conv2D(ConvND):
+  """`Conv2D` module."""
+
+  def __init__(self,
+               output_channels: int,
+               kernel_shape: Union[int, Sequence[int]],
+               stride: Union[int, Sequence[int]] = 1,
+               rate: Union[int, Sequence[int]] = 1,
+               padding: Union[str, pad.Paddings] = "SAME",
+               with_bias: bool = True,
+               w_init: Optional[initializers.Initializer] = None,
+               b_init: Optional[initializers.Initializer] = None,
+               data_format: str = "NHWC",
+               name: Optional[str] = None):
+    """Constructs a ``Conv2D`` module.
+
+    Args:
+      output_channels: The number of output channels.
+      kernel_shape: Sequence of kernel sizes (of length 2), or an integer.
+        ``kernel_shape`` will be expanded to define a kernel size in all
+        dimensions.
+      stride: Sequence of strides (of length 2), or an integer. ``stride`` will
+        be expanded to define stride in all dimensions.
+      rate: Sequence of dilation rates of length 2, or integer that is used to
+        define dilation rate in all dimensions. 1 corresponds to standard
+        convolution, ``rate > 1`` corresponds to dilated convolution.
+      padding: Padding to apply to the input. This can either ``SAME``,
+        ``VALID`` or a callable or sequence of callables of size 2. Any
+        callables must take a single integer argument equal to the effective
+        kernel size and return a list of two integers representing the padding
+        before and after. See snt.pad.* for more details and example functions.
+      with_bias: Whether to include bias parameters. Default ``True``.
+      w_init: Optional initializer for the weights. By default the weights are
+        initialized truncated random normal values with a standard deviation of
+        ``1 / sqrt(input_feature_size)``, which is commonly used when the inputs
+        are zero centered (see https://arxiv.org/abs/1502.03167v3).
+      b_init: Optional initializer for the bias. By default the bias is
+        initialized to zero.
+      data_format: The data format of the input.
+      name: Name of the module.
+    """
+    super().__init__(
         num_spatial_dims=2,
-        output_channels=1,
-        kernel_shape=3,
-        stride=1,
+        output_channels=output_channels,
+        kernel_shape=kernel_shape,
+        stride=stride,
+        rate=rate,
         padding=padding,
         with_bias=with_bias,
-        data_format="NHWC",
-        **create_constant_initializers(1.0, 1.0, with_bias))
-    defun_conv = tf.function(conv2)
-
-    iterations = 5
-
-    for _ in range(iterations):
-      x = tf.random.uniform([1, 5, 5, 1])
-      y1 = conv1(x)
-      y2 = defun_conv(x)
-
-      self.assertAllClose(self.evaluate(y1), self.evaluate(y2), atol=1e-4)
-
-  def testUnknownBatchSizeNHWC(self):
-    x = tf.TensorSpec([None, 5, 5, 3], dtype=tf.float32)
-
-    c = conv.ConvND(
-        num_spatial_dims=2,
-        output_channels=2,
-        kernel_shape=3,
-        data_format="NHWC")
-    defun_conv = tf.function(c).get_concrete_function(x)
-
-    out1 = defun_conv(tf.ones([3, 5, 5, 3]))
-    self.assertEqual(out1.shape, [3, 5, 5, 2])
-
-    out2 = defun_conv(tf.ones([5, 5, 5, 3]))
-    self.assertEqual(out2.shape, [5, 5, 5, 2])
-
-  def testUnknownBatchSizeNCHW(self):
-    if self.primary_device == "CPU":
-      self.skipTest("NCHW not supported on CPU")
-
-    x = tf.TensorSpec([None, 3, 5, 5], dtype=tf.float32)
-    c = conv.ConvND(
-        num_spatial_dims=2,
-        output_channels=2,
-        kernel_shape=3,
-        data_format="NCHW")
-    defun_conv = tf.function(c).get_concrete_function(x)
-
-    out1 = defun_conv(tf.ones([3, 3, 5, 5]))
-    self.assertEqual(out1.shape, [3, 2, 5, 5])
-
-    out2 = defun_conv(tf.ones([5, 3, 5, 5]))
-    self.assertEqual(out2.shape, [5, 2, 5, 5])
-
-  @parameterized.parameters(True, False)
-  def testUnknownChannels(self, autograph):
-    x = tf.TensorSpec([3, 3, 3, None], dtype=tf.float32)
-
-    c = conv.ConvND(
-        num_spatial_dims=2,
-        output_channels=1,
-        kernel_shape=3,
-        data_format="NHWC")
-    defun_conv = tf.function(c, autograph=autograph)
-
-    with self.assertRaisesRegex(ValueError,
-                                "The number of input channels must be known"):
-      defun_conv.get_concrete_function(x)
-
-  def testUnknownSpatialDims(self):
-    x = tf.TensorSpec([3, None, None, 3], dtype=tf.float32)
-
-    c = conv.ConvND(
-        num_spatial_dims=2,
-        output_channels=1,
-        kernel_shape=3,
-        data_format="NHWC")
-    defun_conv = tf.function(c).get_concrete_function(x)
-
-    out = defun_conv(tf.ones([3, 5, 5, 3]))
-    expected_out = c(tf.ones([3, 5, 5, 3]))
-    self.assertEqual(out.shape, [3, 5, 5, 1])
-    self.assertAllEqual(self.evaluate(out), self.evaluate(expected_out))
-
-    out = defun_conv(tf.ones([3, 4, 4, 3]))
-    expected_out = c(tf.ones([3, 4, 4, 3]))
-    self.assertEqual(out.shape, [3, 4, 4, 1])
-    self.assertAllEqual(self.evaluate(out), self.evaluate(expected_out))
+        w_init=w_init,
+        b_init=b_init,
+        data_format=data_format,
+        name=name)
 
 
-class Conv2DTest(test_utils.TestCase, parameterized.TestCase):
+class Conv3D(ConvND):
+  """`Conv3D` module."""
 
-  @parameterized.parameters(True, False)
-  def testComputationPaddingSame(self, with_bias):
-    expected_out = [[4, 6, 6, 6, 4], [6, 9, 9, 9, 6], [6, 9, 9, 9, 6],
-                    [6, 9, 9, 9, 6], [4, 6, 6, 6, 4]]
-    conv1 = conv.Conv2D(
-        output_channels=1,
-        kernel_shape=3,
-        stride=1,
-        padding="SAME",
+  def __init__(self,
+               output_channels: int,
+               kernel_shape: Union[int, Sequence[int]],
+               stride: Union[int, Sequence[int]] = 1,
+               rate: Union[int, Sequence[int]] = 1,
+               padding: Union[str, pad.Paddings] = "SAME",
+               with_bias: bool = True,
+               w_init: Optional[initializers.Initializer] = None,
+               b_init: Optional[initializers.Initializer] = None,
+               data_format: str = "NDHWC",
+               name: Optional[str] = None):
+    """Constructs a ``Conv3D`` module.
+
+    Args:
+      output_channels: The number of output channels.
+      kernel_shape: Sequence of kernel sizes (of length 3), or an integer.
+        ``kernel_shape`` will be expanded to define a kernel size in all
+        dimensions.
+      stride: Sequence of strides (of length 3), or an integer. `stride` will be
+        expanded to define stride in all dimensions.
+      rate: Sequence of dilation rates (of length 3), or integer that is used to
+        define dilation rate in all dimensions. 1 corresponds to standard
+        convolution, ``rate > 1`` corresponds to dilated convolution.
+      padding: Padding to apply to the input. This can either ``SAME``,
+        ``VALID`` or a callable or sequence of callables up to size N. Any
+        callables must take a single integer argument equal to the effective
+        kernel size and return a list of two integers representing the padding
+        before and after. See snt.pad.* for more details and example functions.
+      with_bias: Whether to include bias parameters. Default ``True``.
+      w_init: Optional initializer for the weights. By default the weights are
+        initialized truncated random normal values with a standard deviation of
+        ``1 / sqrt(input_feature_size)``, which is commonly used when the inputs
+        are zero centered (see https://arxiv.org/abs/1502.03167v3).
+      b_init: Optional initializer for the bias. By default the bias is
+        initialized to zero.
+      data_format: The data format of the input.
+      name: Name of the module.
+    """
+    super().__init__(
+        num_spatial_dims=3,
+        output_channels=output_channels,
+        kernel_shape=kernel_shape,
+        stride=stride,
+        rate=rate,
+        padding=padding,
         with_bias=with_bias,
-        **create_constant_initializers(1.0, 1.0, with_bias))
-
-    out = conv1(tf.ones([1, 5, 5, 1], dtype=tf.float32))
-    self.assertEqual(out.shape, [1, 5, 5, 1])
-    out = tf.squeeze(out, axis=(0, 3))
-
-    expected_out = np.asarray(expected_out, dtype=np.float32)
-    if with_bias:
-      expected_out += 1
-
-    self.assertAllClose(self.evaluate(out), expected_out)
-
-  @parameterized.parameters(True, False)
-  def testComputationPaddingValid(self, with_bias):
-    expected_out = [[9, 9, 9], [9, 9, 9], [9, 9, 9]]
-    conv1 = conv.Conv2D(
-        output_channels=1,
-        kernel_shape=3,
-        stride=1,
-        padding="VALID",
-        with_bias=with_bias,
-        **create_constant_initializers(1.0, 1.0, with_bias))
-
-    out = conv1(tf.ones([1, 5, 5, 1], dtype=tf.float32))
-    self.assertEqual(out.shape, [1, 3, 3, 1])
-    out = tf.squeeze(out, axis=(0, 3))
-
-    expected_out = np.asarray(expected_out, dtype=np.float32)
-    if with_bias:
-      expected_out += 1
-
-    self.assertAllClose(self.evaluate(out), expected_out)
-
-
-class Conv1DTest(test_utils.TestCase, parameterized.TestCase):
-
-  @parameterized.parameters(True, False)
-  def testComputationPaddingSame(self, with_bias):
-    expected_out = [2, 3, 3, 3, 2]
-    conv1 = conv.Conv1D(
-        output_channels=1,
-        kernel_shape=3,
-        stride=1,
-        padding="SAME",
-        with_bias=with_bias,
-        **create_constant_initializers(1.0, 1.0, with_bias))
-
-    out = conv1(tf.ones([1, 5, 1], dtype=tf.float32))
-    self.assertEqual(out.shape, [1, 5, 1])
-    out = tf.squeeze(out, axis=(0, 2))
-
-    expected_out = np.asarray(expected_out, dtype=np.float32)
-    if with_bias:
-      expected_out += 1
-
-    self.assertAllClose(self.evaluate(out), expected_out)
-
-  @parameterized.parameters(True, False)
-  def testComputationPaddingValid(self, with_bias):
-    expected_out = [3, 3, 3]
-    expected_out = np.asarray(expected_out, dtype=np.float32)
-    if with_bias:
-      expected_out += 1
-
-    conv1 = conv.Conv1D(
-        output_channels=1,
-        kernel_shape=3,
-        stride=1,
-        padding="VALID",
-        with_bias=with_bias,
-        **create_constant_initializers(1.0, 1.0, with_bias))
-
-    out = conv1(tf.ones([1, 5, 1], dtype=tf.float32))
-    self.assertEqual(out.shape, [1, 3, 1])
-    out = tf.squeeze(out, axis=(0, 2))
-
-    self.assertAllClose(self.evaluate(out), expected_out)
-
-
-class Conv3DTest(test_utils.TestCase, parameterized.TestCase):
-
-  @parameterized.parameters(True, False)
-  def testComputationPaddingSame(self, with_bias):
-    expected_out = np.asarray([
-        9, 13, 13, 13, 9, 13, 19, 19, 19, 13, 13, 19, 19, 19, 13, 13, 19, 19,
-        19, 13, 9, 13, 13, 13, 9, 13, 19, 19, 19, 13, 19, 28, 28, 28, 19, 19,
-        28, 28, 28, 19, 19, 28, 28, 28, 19, 13, 19, 19, 19, 13, 13, 19, 19, 19,
-        13, 19, 28, 28, 28, 19, 19, 28, 28, 28, 19, 19, 28, 28, 28, 19, 13, 19,
-        19, 19, 13, 13, 19, 19, 19, 13, 19, 28, 28, 28, 19, 19, 28, 28, 28, 19,
-        19, 28, 28, 28, 19, 13, 19, 19, 19, 13, 9, 13, 13, 13, 9, 13, 19, 19,
-        19, 13, 13, 19, 19, 19, 13, 13, 19, 19, 19, 13, 9, 13, 13, 13, 9
-    ]).reshape((5, 5, 5))
-    if not with_bias:
-      expected_out -= 1
-
-    conv1 = conv.Conv3D(
-        output_channels=1,
-        kernel_shape=3,
-        stride=1,
-        padding="SAME",
-        with_bias=with_bias,
-        **create_constant_initializers(1.0, 1.0, with_bias))
-
-    out = conv1(tf.ones([1, 5, 5, 5, 1], dtype=tf.float32))
-    self.assertEqual(out.shape, [1, 5, 5, 5, 1])
-    out = tf.squeeze(out, axis=(0, 4))
-
-    self.assertAllClose(self.evaluate(out), expected_out)
-
-  @parameterized.parameters(True, False)
-  def testComputationPaddingValid(self, with_bias):
-    expected_out = np.asarray([
-        28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
-        28, 28, 28, 28, 28, 28, 28, 28, 28
-    ]).reshape((3, 3, 3))
-    if not with_bias:
-      expected_out -= 1
-
-    conv1 = conv.Conv3D(
-        output_channels=1,
-        kernel_shape=3,
-        stride=1,
-        padding="VALID",
-        with_bias=with_bias,
-        **create_constant_initializers(1.0, 1.0, with_bias))
-
-    out = conv1(tf.ones([1, 5, 5, 5, 1], dtype=tf.float32))
-    self.assertEqual(out.shape, [1, 3, 3, 3, 1])
-    out = tf.squeeze(out, axis=(0, 4))
-
-    self.assertAllClose(self.evaluate(out), expected_out)
-
-
-if __name__ == "__main__":
-  tf.test.main()
+        w_init=w_init,
+        b_init=b_init,
+        data_format=data_format,
+        name=name)
