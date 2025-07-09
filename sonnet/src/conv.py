@@ -307,7 +307,7 @@ class Conv3D(ConvND):
         dimensions.
       stride: Sequence of strides (of length 3), or an integer. `stride` will be
         expanded to define stride in all dimensions.
-      rate: Sequence of dilation rates (of length 3), or integer that is used to
+      rate: Sequence of dilation rates of length 3), or integer that is used to
         define dilation rate in all dimensions. 1 corresponds to standard
         convolution, ``rate > 1`` corresponds to dilated convolution.
       padding: Padding to apply to the input. This can either ``SAME``,
